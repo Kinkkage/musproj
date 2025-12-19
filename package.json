@@ -1,0 +1,9 @@
+{
+  "name": "musproj",
+  "private": true,
+  "packageManager": "pnpm@10.25.0",
+  "scripts": {
+    "dev:api": "pnpm -C apps/api exec tsx src/server.ts",
+    "dev:worker": "pnpm -C apps/worker exec tsx src/worker.ts"
+  }
+}
