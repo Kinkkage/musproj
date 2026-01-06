@@ -218,53 +218,85 @@ async function main() {
   });
 
   app.post("/loop/apply", async (req, reply) => {
-    const body = LoopApplyBody.parse(req.body);
+  const body = LoopApplyBody.parse(req.body);
 
-    // 1) убеждаемся, что input версия существует
-    const inMeta = await connection.hgetall(`asset:${body.assetId}:v:${body.version}`);
-    if (!inMeta?.objectKey) return reply.code(404).send({ error: "Input version not found" });
+  // 1) убеждаемся, что input версия существует
+  const inMeta = await connection.hgetall(`asset:${body.assetId}:v:${body.version}`);
+  if (!inMeta?.objectKey) return reply.code(404).send({ error: "Input version not found" });
 
-    // 2) берём preview мету
-    const previewKey = `asset:${body.assetId}:loopPreview:v${body.version}`;
-    const preview = await connection.hgetall(previewKey);
-    if (!preview?.startMs || !preview?.endMs) {
-      return reply.code(400).send({
-        error: "Loop preview not set for this version",
-        need: "POST /loop/preview first",
-        previewKey,
-      });
-    }
-
-    // 3) создаём job "LOOP_APPLY"
-    const job = await audioQueue.add(
-      "audio-job",
-      {
-        type: "LOOP_APPLY",
-        assetId: body.assetId,
-        inputVersion: body.version,
-        loop: {
-          startMs: Number(preview.startMs),
-          endMs: Number(preview.endMs),
-          crossfadeMs: Number(preview.crossfadeMs ?? "10"),
-        },
-      },
-      { removeOnComplete: false, removeOnFail: false }
-    );
-
-    await connection.hset(`job:${job.id}`, {
-      jobId: String(job.id),
-      assetId: body.assetId,
-      type: "LOOP_APPLY",
-      inputVersion: String(body.version),
-      createdAt: new Date().toISOString(),
+  // 2) берём preview мету
+  const previewKey = `asset:${body.assetId}:loopPreview:v${body.version}`;
+  const preview = await connection.hgetall(previewKey);
+  if (!preview?.startMs || !preview?.endMs) {
+    return reply.code(400).send({
+      error: "Loop preview not set for this version",
+      need: "POST /loop/preview first",
+      previewKey,
     });
+  }
 
+  const loop = {
+    startMs: Number(preview.startMs),
+    endMs: Number(preview.endMs),
+    crossfadeMs: Number(preview.crossfadeMs ?? "10"),
+  };
+
+  // 3) idempotency key (одинаковые входы -> один jobId)
+  const paramsString = JSON.stringify({
+    assetId: body.assetId,
+    inputVersion: body.version,
+    loop,
+  });
+
+  const paramsHash = crypto.createHash("sha1").update(paramsString).digest("hex");
+  const idemKey = `idem:LOOP_APPLY:${body.assetId}:v${body.version}:${paramsHash}`;
+
+  const existingJobId = await connection.get(idemKey);
+  if (existingJobId) {
     return reply.send({
       ok: true,
-      jobId: String(job.id),
-      note: "Worker will create a new version in R2 (copy for now) and attach loop metadata.",
+      jobId: existingJobId,
+      idem: true,
+      note: "Same params -> returning existing jobId",
     });
+  }
+
+  // 4) создаём job "LOOP_APPLY"
+  const job = await audioQueue.add(
+    "audio-job",
+    {
+      type: "LOOP_APPLY",
+      assetId: body.assetId,
+      inputVersion: body.version,
+      loop,
+      idemKey,        // полезно хранить и в job.data
+      paramsHash,     // полезно для отладки
+    },
+    { removeOnComplete: false, removeOnFail: false }
+  );
+
+  // 5) сохраняем idemKey -> jobId (чтобы повтор не создавал дубль)
+  await connection.set(idemKey, String(job.id));
+
+  await connection.hset(`job:${job.id}`, {
+    jobId: String(job.id),
+    assetId: body.assetId,
+    type: "LOOP_APPLY",
+    inputVersion: String(body.version),
+    paramsHash,
+    idemKey,
+    createdAt: new Date().toISOString(),
   });
+
+  return reply.send({
+    ok: true,
+    jobId: String(job.id),
+    idem: false,
+    note: "Worker will create a new version in R2 and attach loop metadata.",
+  });
+});
+
+
 
   // =========================================
   // Jobs (queue) endpoints
@@ -282,6 +314,15 @@ async function main() {
     const latestStr = await connection.get(`asset:${body.assetId}:latestVersion`);
     const latest = latestStr ? Number(latestStr) : 1;
     const inputVersion = body.inputVersion ?? latest;
+    // Проверка: существует ли версия inputVersion
+const vMeta = await connection.hgetall(`asset:${body.assetId}:v:${inputVersion}`);
+if (!vMeta?.objectKey) {
+  return reply.code(404).send({
+    error: "Input version not found",
+    assetId: body.assetId,
+    inputVersion,
+  });
+}
 
     const job = await audioQueue.add(
       "audio-job",

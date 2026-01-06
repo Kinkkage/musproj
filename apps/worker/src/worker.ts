@@ -1,40 +1,46 @@
 import "dotenv/config";
 import IORedis from "ioredis";
 import { Worker } from "bullmq";
-import { S3Client, CopyObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
-type JobData =
-  | {
-      type: "LOOP" | "DENOISE" | "SEPARATE";
-      assetId: string;
-      inputVersion: number;
-    }
-  | {
-      type: "LOOP_APPLY";
-      assetId: string;
-      inputVersion: number;
-      loop: { startMs: number; endMs: number; crossfadeMs: number };
-    };
+import { modules } from "./modules";
+import { ProcessingModule } from "./types/processing";
+
+type JobData = {
+  type: string;
+  assetId: string;
+  inputVersion: number;
+  [key: string]: any;
+};
+
+type InputMeta = {
+  objectKey: string;
+  [key: string]: any;
+};
+
+function mustEnv(name: string): string {
+  const v = process.env[name]?.trim();
+  if (!v) throw new Error(`${name} missing in apps/worker/.env`);
+  return v;
+}
+
+async function getInputMeta(redis: IORedis, assetId: string, inputVersion: number): Promise<InputMeta> {
+  const assetKey = `asset:${assetId}`;
+  const inMeta = await redis.hgetall(`${assetKey}:v:${inputVersion}`);
+  if (!inMeta?.objectKey) throw new Error(`Input version not found: asset=${assetId} v${inputVersion}`);
+  return inMeta as unknown as InputMeta;
+}
 
 async function main() {
   // ---------- Redis ----------
-  const redisUrl = process.env.REDIS_URL?.trim();
-  if (!redisUrl) throw new Error("REDIS_URL missing in apps/worker/.env");
-
-  const connection = new IORedis(redisUrl, {
-    maxRetriesPerRequest: null,
-    tls: {},
-  });
+  const redisUrl = mustEnv("REDIS_URL");
+  const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null, tls: {} });
 
   // ---------- R2 ----------
-  const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID?.trim();
-  const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID?.trim();
-  const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY?.trim();
-  const R2_BUCKET = process.env.R2_BUCKET?.trim();
-
-  if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
-    throw new Error("R2 env missing in apps/worker/.env (R2_*)");
-  }
+  const R2_ACCOUNT_ID = mustEnv("R2_ACCOUNT_ID");
+  const R2_ACCESS_KEY_ID = mustEnv("R2_ACCESS_KEY_ID");
+  const R2_SECRET_ACCESS_KEY = mustEnv("R2_SECRET_ACCESS_KEY");
+  const R2_BUCKET = mustEnv("R2_BUCKET");
 
   const s3 = new S3Client({
     region: "auto",
@@ -51,72 +57,88 @@ async function main() {
   const worker = new Worker<JobData>(
     "audio-jobs",
     async (job) => {
-      console.log("Job start:", job.id, job.data);
+      try {
+        console.log("Job start:", { jobId: job.id, type: job.data.type, assetId: job.data.assetId });
 
-      const assetKey = `asset:${job.data.assetId}`;
+        const { type, assetId, inputVersion } = job.data;
+        const assetKey = `asset:${assetId}`;
 
-      // input version meta
-      const inMeta = await connection.hgetall(`${assetKey}:v:${job.data.inputVersion}`);
-      if (!inMeta?.objectKey) throw new Error(`Input version not found: v${job.data.inputVersion}`);
+        // ---------- module ----------
+        const module: ProcessingModule | undefined = modules[type as keyof typeof modules];
+        if (!module) throw new Error(`Unknown processing module: ${type}`);
 
-      // output version
-      const latestStr = await connection.get(`${assetKey}:latestVersion`);
-      const latest = latestStr ? Number(latestStr) : job.data.inputVersion;
-      const outVersion = Math.max(latest, job.data.inputVersion) + 1;
+        // ---------- input meta + sanity ----------
+        const inMeta = await getInputMeta(connection, assetId, inputVersion);
+        await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: inMeta.objectKey }));
 
-      const kind = job.data.type.toLowerCase();
-      const outObjectKey = `assets/${job.data.assetId}/v${outVersion}/${kind}.wav`;
+        // ---------- deterministic output path (no duplicates) ----------
+        const outObjectKey = `assets/${assetId}/jobs/${job.id}/output.wav`;
 
-      await job.updateProgress(10);
+        // ---------- allocate next version number via counter ----------
+        // IMPORTANT: versionCounter должен существовать (API поставит "1" при upload/request)
+        const outVersion = Number(await connection.incr(`${assetKey}:versionCounter`));
 
-      // sanity: input exists in R2
-      await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: inMeta.objectKey }));
+        // ---------- create version meta as PENDING (do NOT set latest yet) ----------
+        await connection.hset(`${assetKey}:v:${outVersion}`, {
+          version: String(outVersion),
+          objectKey: outObjectKey,
+          kind: type.toLowerCase(),
+          status: "PENDING",
+          createdAt: new Date().toISOString(),
+          fromVersion: String(inputVersion),
+          jobId: String(job.id),
+          storage: "r2",
+        });
+        await connection.rpush(`${assetKey}:versions`, String(outVersion));
 
-      // A) Реальный файл: пока просто COPY input -> output
-      await s3.send(
-        new CopyObjectCommand({
-          Bucket: R2_BUCKET,
-          Key: outObjectKey,
-          CopySource: `/${R2_BUCKET}/${inMeta.objectKey}`,
-          ContentType: "audio/wav",
-          MetadataDirective: "REPLACE",
-        })
-      );
+        await job.updateProgress(10);
 
-      await job.updateProgress(80);
+        // ---------- run module ----------
+        const result = await module.run({
+          assetId,
+          inputVersion,
+          jobId: String(job.id),
+          outputObjectKey: outObjectKey,
+          payload: {
+            ...job.data,
+            inObjectKey: inMeta.objectKey, // модулю нужен входной ключ
+          },
+        });
 
-      // meta for new version
-      const meta: Record<string, string> = {
-        version: String(outVersion),
-        objectKey: outObjectKey,
-        kind,
-        createdAt: new Date().toISOString(),
-        fromVersion: String(job.data.inputVersion),
-        jobId: String(job.id),
-        storage: "r2",
-      };
+        if (!result.ok) throw new Error(`Module ${type} failed`);
 
-      // Если это LOOP_APPLY — прикрепим метаданные региона
-      if (job.data.type === "LOOP_APPLY") {
-        meta.loopStartMs = String(job.data.loop.startMs);
-        meta.loopEndMs = String(job.data.loop.endMs);
-        meta.loopCrossfadeMs = String(job.data.loop.crossfadeMs);
+        await job.updateProgress(80);
+
+        // ---------- mark READY + set latest only now ----------
+        await connection.hset(`${assetKey}:v:${outVersion}`, {
+          status: "READY",
+          objectKey: result.objectKey,
+          ...(result.meta ?? {}),
+          readyAt: new Date().toISOString(),
+        });
+
+        await connection.set(`${assetKey}:latestVersion`, String(outVersion));
+        await connection.set(`asset:${assetId}:versionCounter`, "1");
+        
+        await job.updateProgress(100);
+
+        return {
+          ok: true,
+          processedAt: new Date().toISOString(),
+          createdVersion: outVersion,
+          objectKey: result.objectKey,
+          from: inMeta.objectKey,
+          type,
+        };
+      } catch (err) {
+        console.error("PROCESSING ERROR", {
+          jobId: job.id,
+          type: (job.data as any)?.type,
+          assetId: (job.data as any)?.assetId,
+          error: err,
+        });
+        throw err;
       }
-
-      await connection.hset(`${assetKey}:v:${outVersion}`, meta);
-      await connection.rpush(`${assetKey}:versions`, String(outVersion));
-      await connection.set(`${assetKey}:latestVersion`, String(outVersion));
-
-      await job.updateProgress(100);
-
-      return {
-        ok: true,
-        processedAt: new Date().toISOString(),
-        createdVersion: outVersion,
-        objectKey: outObjectKey,
-        from: inMeta.objectKey,
-        type: job.data.type,
-      };
     },
     { connection }
   );

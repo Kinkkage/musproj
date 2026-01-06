@@ -18,3 +18,24 @@ Backend foundation:
 1) Install deps from repo root:
 ```bash
 pnpm install
+
+## Architecture
+
+This project uses a modular audio-processing architecture.
+
+- API creates jobs
+- Worker executes jobs
+- Each processing step is a module
+
+### Worker responsibilities
+- job orchestration
+- versioning
+- storage (R2)
+- metadata
+
+### Module responsibilities
+- actual audio processing
+- producing output audio
+- returning objectKey
+
+Modules must implement ProcessingModule interface.
