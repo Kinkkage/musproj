@@ -272,7 +272,14 @@ async function main() {
       idemKey,        // полезно хранить и в job.data
       paramsHash,     // полезно для отладки
     },
-    { removeOnComplete: false, removeOnFail: false }
+    {
+    removeOnComplete: false,
+    removeOnFail: false,
+    attempts: 3,
+    backoff: { type: "exponential", delay: 2000 },
+    timeout: 2 * 60 * 1000,
+}
+
   );
 
   // 5) сохраняем idemKey -> jobId (чтобы повтор не создавал дубль)
@@ -325,10 +332,17 @@ if (!vMeta?.objectKey) {
 }
 
     const job = await audioQueue.add(
-      "audio-job",
-      { type: body.type, assetId: body.assetId, inputVersion },
-      { removeOnComplete: false, removeOnFail: false }
-    );
+  "audio-job",
+  { type: body.type, assetId: body.assetId, inputVersion },
+  {
+    removeOnComplete: false,
+    removeOnFail: false,
+    attempts: 3,
+    backoff: { type: "exponential", delay: 2000 },
+    timeout: 2 * 60 * 1000,
+  }
+);
+
 
     await connection.hset(`job:${job.id}`, {
       jobId: String(job.id),

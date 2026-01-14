@@ -7,48 +7,71 @@ function mustEnv(name: string): string {
   return v;
 }
 
-const s3 = new S3Client({
-  region: "auto",
-  endpoint: `https://${mustEnv("R2_ACCOUNT_ID")}.r2.cloudflarestorage.com`,
-  credentials: {
-    accessKeyId: mustEnv("R2_ACCESS_KEY_ID"),
-    secretAccessKey: mustEnv("R2_SECRET_ACCESS_KEY"),
-  },
-  forcePathStyle: true,
-  requestChecksumCalculation: "WHEN_REQUIRED",
-  responseChecksumValidation: "WHEN_REQUIRED",
-});
-
-const BUCKET = mustEnv("R2_BUCKET");
-
 export const loopApplyModule: ProcessingModule = {
   type: "LOOP_APPLY",
 
-  async run(input) {
-    const inKey = String(input.payload?.inObjectKey ?? "");
-    if (!inKey) {
-      // worker всегда может прокинуть inObjectKey; если нет — модуль не знает откуда копировать
-      return { ok: false, objectKey: input.outputObjectKey, meta: { error: "inObjectKey missing" } };
+  async run(input: any) {
+    // input приходит из worker.ts, мы ждём поля:
+    // input.inputObjectKey, input.outputObjectKey, input.payload.loop
+
+    const R2_ACCOUNT_ID = mustEnv("R2_ACCOUNT_ID");
+    const R2_ACCESS_KEY_ID = mustEnv("R2_ACCESS_KEY_ID");
+    const R2_SECRET_ACCESS_KEY = mustEnv("R2_SECRET_ACCESS_KEY");
+    const R2_BUCKET = mustEnv("R2_BUCKET");
+
+    const s3 = new S3Client({
+      region: "auto",
+      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: {
+        accessKeyId: R2_ACCESS_KEY_ID,
+        secretAccessKey: R2_SECRET_ACCESS_KEY,
+      },
+      forcePathStyle: true,
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED",
+    });
+
+    const inputObjectKey = input.inputObjectKey as string | undefined;
+    const outputObjectKey = input.outputObjectKey as string | undefined;
+
+    if (!inputObjectKey) {
+      return {
+        ok: false,
+        objectKey: "",
+        meta: { error: "inputObjectKey missing" },
+      };
     }
 
-    // stub: просто копируем input -> output
+    if (!outputObjectKey) {
+      return {
+        ok: false,
+        objectKey: "",
+        meta: { error: "outputObjectKey missing" },
+      };
+    }
+
+    // Сейчас делаем заглушку обработки:
+    // COPY input -> output (как будто "применили луп")
     await s3.send(
       new CopyObjectCommand({
-        Bucket: BUCKET,
-        Key: input.outputObjectKey,
-        CopySource: `/${BUCKET}/${inKey}`,
+        Bucket: R2_BUCKET,
+        Key: outputObjectKey,
+        CopySource: `/${R2_BUCKET}/${inputObjectKey}`,
         ContentType: "audio/wav",
         MetadataDirective: "REPLACE",
       })
     );
 
+    // В meta фиксируем параметры лупа
+    const loop = input.payload?.loop ?? {};
     return {
       ok: true,
-      objectKey: input.outputObjectKey,
+      objectKey: outputObjectKey,
       meta: {
-        loopStartMs: String(input.payload?.loop?.startMs ?? ""),
-        loopEndMs: String(input.payload?.loop?.endMs ?? ""),
-        loopCrossfadeMs: String(input.payload?.loop?.crossfadeMs ?? ""),
+        loopStartMs: String(loop.startMs ?? ""),
+        loopEndMs: String(loop.endMs ?? ""),
+        loopCrossfadeMs: String(loop.crossfadeMs ?? ""),
+        note: "LOOP_APPLY: copy stub (DSP later)",
       },
     };
   },

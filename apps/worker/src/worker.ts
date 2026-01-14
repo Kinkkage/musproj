@@ -18,23 +18,146 @@ type InputMeta = {
   [key: string]: any;
 };
 
+type JobError = {
+  code: string;
+  message: string;
+  retryable: boolean;
+  details?: any;
+};
+
 function mustEnv(name: string): string {
   const v = process.env[name]?.trim();
   if (!v) throw new Error(`${name} missing in apps/worker/.env`);
   return v;
 }
 
-async function getInputMeta(redis: IORedis, assetId: string, inputVersion: number): Promise<InputMeta> {
+function fileNameForType(type: string): string {
+  if (type === "LOOP_APPLY") return "loop.wav";
+  return `${type.toLowerCase()}.wav`;
+}
+
+function classifyError(err: any): JobError {
+  const msg = String(err?.message ?? err);
+
+  // простая классификация (потом улучшим)
+  const retryable =
+    err?.code === "ECONNRESET" ||
+    err?.code === "ETIMEDOUT" ||
+    err?.code === "ENOTFOUND" ||
+    msg.includes("timeout") ||
+    msg.includes("Too Many Requests") ||
+    msg.includes("429");
+
+  // “плохой ввод” / “нет данных” обычно не ретраим
+  if (msg.includes("Input version not found") || msg.includes("Unknown processing module")) {
+    return { code: "BAD_INPUT", message: msg, retryable: false };
+  }
+
+  return {
+    code: retryable ? "RETRYABLE" : "PROCESSING_FAILED",
+    message: msg,
+    retryable,
+    details: err?.stack ? { stack: err.stack } : undefined,
+  };
+}
+
+async function getInputMeta(
+  redis: IORedis,
+  assetId: string,
+  inputVersion: number
+): Promise<InputMeta> {
   const assetKey = `asset:${assetId}`;
   const inMeta = await redis.hgetall(`${assetKey}:v:${inputVersion}`);
-  if (!inMeta?.objectKey) throw new Error(`Input version not found: asset=${assetId} v${inputVersion}`);
+  if (!inMeta?.objectKey) {
+    throw new Error(`Input version not found: asset=${assetId} v${inputVersion}`);
+  }
   return inMeta as unknown as InputMeta;
+}
+
+async function pickNextVersion(redis: IORedis, assetId: string, fallback: number): Promise<number> {
+  const assetKey = `asset:${assetId}`;
+  const latestStr = await redis.get(`${assetKey}:latestVersion`);
+  const latest = latestStr ? Number(latestStr) : fallback;
+  return latest + 1;
+}
+
+async function createPendingVersionMeta(opts: {
+  redis: IORedis;
+  assetId: string;
+  outVersion: number;
+  type: string;
+  inputVersion: number;
+  jobId: string;
+  objectKey: string; // planned object key
+}) {
+  const { redis, assetId, outVersion, type, inputVersion, jobId, objectKey } = opts;
+  const assetKey = `asset:${assetId}`;
+
+  await redis.hset(`${assetKey}:v:${outVersion}`, {
+    version: String(outVersion),
+    objectKey,
+    kind: type.toLowerCase(),
+    status: "PENDING",
+    createdAt: new Date().toISOString(),
+    fromVersion: String(inputVersion),
+    jobId,
+    storage: "r2",
+  });
+
+  // добавляем в список версий сразу (так проще дебажить)
+  await redis.rpush(`${assetKey}:versions`, String(outVersion));
+}
+
+async function markVersionReady(opts: {
+  redis: IORedis;
+  assetId: string;
+  outVersion: number;
+  objectKey: string;
+  extraMeta?: Record<string, string>;
+}) {
+  const { redis, assetId, outVersion, objectKey, extraMeta } = opts;
+  const assetKey = `asset:${assetId}`;
+
+  await redis.hset(`${assetKey}:v:${outVersion}`, {
+    status: "READY",
+    objectKey,
+    readyAt: new Date().toISOString(),
+    ...(extraMeta ?? {}),
+  });
+
+  // ВАЖНО: latestVersion только при READY
+  await redis.set(`${assetKey}:latestVersion`, String(outVersion));
+}
+
+async function markVersionFailed(opts: {
+  redis: IORedis;
+  assetId: string;
+  outVersion: number;
+  error: JobError;
+}) {
+  const { redis, assetId, outVersion, error } = opts;
+  const assetKey = `asset:${assetId}`;
+
+  await redis.hset(`${assetKey}:v:${outVersion}`, {
+    status: "FAILED",
+    failedAt: new Date().toISOString(),
+    errorCode: error.code,
+    errorMessage: error.message,
+    errorRetryable: String(error.retryable),
+  });
+}
+
+async function saveJobStatus(redis: IORedis, jobId: string, patch: Record<string, string>) {
+  await redis.hset(`job:${jobId}`, patch);
 }
 
 async function main() {
   // ---------- Redis ----------
   const redisUrl = mustEnv("REDIS_URL");
-  const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null, tls: {} });
+  const connection = new IORedis(redisUrl, {
+    maxRetriesPerRequest: null,
+    tls: {},
+  });
 
   // ---------- R2 ----------
   const R2_ACCOUNT_ID = mustEnv("R2_ACCOUNT_ID");
@@ -57,39 +180,53 @@ async function main() {
   const worker = new Worker<JobData>(
     "audio-jobs",
     async (job) => {
+      const jobId = String(job.id);
+
       try {
-        console.log("Job start:", { jobId: job.id, type: job.data.type, assetId: job.data.assetId });
+        console.log("Job start:", jobId, job.data);
 
         const { type, assetId, inputVersion } = job.data;
         const assetKey = `asset:${assetId}`;
 
-        // ---------- module ----------
-        const module: ProcessingModule | undefined = modules[type as keyof typeof modules];
-        if (!module) throw new Error(`Unknown processing module: ${type}`);
-
-        // ---------- input meta + sanity ----------
-        const inMeta = await getInputMeta(connection, assetId, inputVersion);
-        await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: inMeta.objectKey }));
-
-        // ---------- deterministic output path (no duplicates) ----------
-        const outObjectKey = `assets/${assetId}/jobs/${job.id}/output.wav`;
-
-        // ---------- allocate next version number via counter ----------
-        // IMPORTANT: versionCounter должен существовать (API поставит "1" при upload/request)
-        const outVersion = Number(await connection.incr(`${assetKey}:versionCounter`));
-
-        // ---------- create version meta as PENDING (do NOT set latest yet) ----------
-        await connection.hset(`${assetKey}:v:${outVersion}`, {
-          version: String(outVersion),
-          objectKey: outObjectKey,
-          kind: type.toLowerCase(),
-          status: "PENDING",
-          createdAt: new Date().toISOString(),
-          fromVersion: String(inputVersion),
-          jobId: String(job.id),
-          storage: "r2",
+        await saveJobStatus(connection, jobId, {
+          status: "RUNNING",
+          startedAt: new Date().toISOString(),
+          assetId,
+          type,
+          inputVersion: String(inputVersion),
         });
-        await connection.rpush(`${assetKey}:versions`, String(outVersion));
+
+        // ---------- input meta ----------
+        const inMeta = await getInputMeta(connection, assetId, inputVersion);
+
+        // sanity: input exists in R2
+        await s3.send(
+          new HeadObjectCommand({
+            Bucket: R2_BUCKET,
+            Key: inMeta.objectKey,
+          })
+        );
+
+        // ---------- select module ----------
+        const module: ProcessingModule | undefined = modules[type];
+        if (!module) {
+          throw new Error(`Unknown processing module: ${type}`);
+        }
+
+        // ---------- prepare output version + key ----------
+        const outVersion = await pickNextVersion(connection, assetId, inputVersion);
+        const outObjectKey = `assets/${assetId}/v${outVersion}/${fileNameForType(type)}`;
+
+        // создаём версию сразу (PENDING)
+        await createPendingVersionMeta({
+          redis: connection,
+          assetId,
+          outVersion,
+          type,
+          inputVersion,
+          jobId,
+          objectKey: outObjectKey,
+        });
 
         await job.updateProgress(10);
 
@@ -97,29 +234,46 @@ async function main() {
         const result = await module.run({
           assetId,
           inputVersion,
-          jobId: String(job.id),
+          jobId,
+
+          // подсказки модулю (куда писать)
+          outputVersion: outVersion,
           outputObjectKey: outObjectKey,
-          payload: {
-            ...job.data,
-            inObjectKey: inMeta.objectKey, // модулю нужен входной ключ
-          },
-        });
 
-        if (!result.ok) throw new Error(`Module ${type} failed`);
+          // подсказка (откуда читать)
+          inputObjectKey: inMeta.objectKey,
 
-        await job.updateProgress(80);
+          payload: job.data,
+        } as any);
 
-        // ---------- mark READY + set latest only now ----------
-        await connection.hset(`${assetKey}:v:${outVersion}`, {
-          status: "READY",
+        if (!result.ok) {
+          throw new Error(`Module ${type} failed`);
+        }
+
+        // ВАЖНО: файл должен реально существовать
+        await s3.send(
+          new HeadObjectCommand({
+            Bucket: R2_BUCKET,
+            Key: result.objectKey,
+          })
+        );
+
+        // ---------- READY + latest ----------
+        await markVersionReady({
+          redis: connection,
+          assetId,
+          outVersion,
           objectKey: result.objectKey,
-          ...(result.meta ?? {}),
-          readyAt: new Date().toISOString(),
+          extraMeta: result.meta ?? undefined,
         });
 
-        await connection.set(`${assetKey}:latestVersion`, String(outVersion));
-        await connection.set(`asset:${assetId}:versionCounter`, "1");
-        
+        await saveJobStatus(connection, jobId, {
+          status: "SUCCEEDED",
+          finishedAt: new Date().toISOString(),
+          createdVersion: String(outVersion),
+          objectKey: result.objectKey,
+        });
+
         await job.updateProgress(100);
 
         return {
@@ -131,12 +285,40 @@ async function main() {
           type,
         };
       } catch (err) {
+        const e = classifyError(err);
         console.error("PROCESSING ERROR", {
-          jobId: job.id,
+          jobId,
           type: (job.data as any)?.type,
           assetId: (job.data as any)?.assetId,
-          error: err,
+          inputVersion: (job.data as any)?.inputVersion,
+          error: e,
         });
+
+        // если успели создать outVersion — попробуем пометить FAILED
+        const assetId = (job.data as any)?.assetId as string | undefined;
+        const inputVersion = (job.data as any)?.inputVersion as number | undefined;
+
+        // мы не всегда знаем outVersion, но чаще знаем (по тому же алгоритму)
+        if (assetId && typeof inputVersion === "number") {
+          try {
+            const outVersion = await pickNextVersion(connection, assetId, inputVersion);
+            // ВНИМАНИЕ: pickNextVersion вернёт next+1, а нам нужен тот, который создавали.
+            // Поэтому помечаем FAILED только если эта версия уже существует и PENDING.
+            const maybe = await connection.hgetall(`asset:${assetId}:v:${outVersion}`);
+            if (maybe?.status === "PENDING") {
+              await markVersionFailed({ redis: connection, assetId, outVersion, error: e });
+            }
+          } catch {}
+        }
+
+        await saveJobStatus(connection, jobId, {
+          status: "FAILED",
+          finishedAt: new Date().toISOString(),
+          errorCode: e.code,
+          errorMessage: e.message,
+          errorRetryable: String(e.retryable),
+        });
+
         throw err;
       }
     },
