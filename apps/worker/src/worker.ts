@@ -5,24 +5,19 @@ import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
 import { modules } from "./modules";
 import { ProcessingModule } from "./types/processing";
+import { AppError, toAppError } from "./errors/appError";
 
 type JobData = {
   type: string;
   assetId: string;
   inputVersion: number;
+  requestId?: string;
   [key: string]: any;
 };
 
 type InputMeta = {
   objectKey: string;
   [key: string]: any;
-};
-
-type JobError = {
-  code: string;
-  message: string;
-  retryable: boolean;
-  details?: any;
 };
 
 function mustEnv(name: string): string {
@@ -36,31 +31,6 @@ function fileNameForType(type: string): string {
   return `${type.toLowerCase()}.wav`;
 }
 
-function classifyError(err: any): JobError {
-  const msg = String(err?.message ?? err);
-
-  // простая классификация (потом улучшим)
-  const retryable =
-    err?.code === "ECONNRESET" ||
-    err?.code === "ETIMEDOUT" ||
-    err?.code === "ENOTFOUND" ||
-    msg.includes("timeout") ||
-    msg.includes("Too Many Requests") ||
-    msg.includes("429");
-
-  // “плохой ввод” / “нет данных” обычно не ретраим
-  if (msg.includes("Input version not found") || msg.includes("Unknown processing module")) {
-    return { code: "BAD_INPUT", message: msg, retryable: false };
-  }
-
-  return {
-    code: retryable ? "RETRYABLE" : "PROCESSING_FAILED",
-    message: msg,
-    retryable,
-    details: err?.stack ? { stack: err.stack } : undefined,
-  };
-}
-
 async function getInputMeta(
   redis: IORedis,
   assetId: string,
@@ -69,7 +39,12 @@ async function getInputMeta(
   const assetKey = `asset:${assetId}`;
   const inMeta = await redis.hgetall(`${assetKey}:v:${inputVersion}`);
   if (!inMeta?.objectKey) {
-    throw new Error(`Input version not found: asset=${assetId} v${inputVersion}`);
+    throw new AppError({
+      code: "NOT_FOUND",
+      message: `Input version not found: asset=${assetId} v${inputVersion}`,
+      retryable: false,
+      details: { assetId, inputVersion },
+    });
   }
   return inMeta as unknown as InputMeta;
 }
@@ -88,9 +63,10 @@ async function createPendingVersionMeta(opts: {
   type: string;
   inputVersion: number;
   jobId: string;
-  objectKey: string; // planned object key
+  objectKey: string;
+  requestId?: string;
 }) {
-  const { redis, assetId, outVersion, type, inputVersion, jobId, objectKey } = opts;
+  const { redis, assetId, outVersion, type, inputVersion, jobId, objectKey, requestId } = opts;
   const assetKey = `asset:${assetId}`;
 
   await redis.hset(`${assetKey}:v:${outVersion}`, {
@@ -101,12 +77,18 @@ async function createPendingVersionMeta(opts: {
     createdAt: new Date().toISOString(),
     fromVersion: String(inputVersion),
     jobId,
+    ...(requestId ? { requestId } : {}),
     storage: "r2",
   });
 
-  // добавляем в список версий сразу (так проще дебажить)
-  await redis.rpush(`${assetKey}:versions`, String(outVersion));
+  // ✅ не добавляем дубли в список versions
+  const vStr = String(outVersion);
+  const exists = await redis.lpos(`${assetKey}:versions`, vStr);
+  if (exists === null) {
+    await redis.rpush(`${assetKey}:versions`, vStr);
+  }
 }
+
 
 async function markVersionReady(opts: {
   redis: IORedis;
@@ -125,7 +107,6 @@ async function markVersionReady(opts: {
     ...(extraMeta ?? {}),
   });
 
-  // ВАЖНО: latestVersion только при READY
   await redis.set(`${assetKey}:latestVersion`, String(outVersion));
 }
 
@@ -133,7 +114,7 @@ async function markVersionFailed(opts: {
   redis: IORedis;
   assetId: string;
   outVersion: number;
-  error: JobError;
+  error: AppError;
 }) {
   const { redis, assetId, outVersion, error } = opts;
   const assetKey = `asset:${assetId}`;
@@ -149,6 +130,41 @@ async function markVersionFailed(opts: {
 
 async function saveJobStatus(redis: IORedis, jobId: string, patch: Record<string, string>) {
   await redis.hset(`job:${jobId}`, patch);
+}
+
+function logJson(obj: Record<string, any>) {
+  console.log(JSON.stringify(obj));
+}
+
+// Реальный таймаут на уровне приложения (не зависим от BullMQ)
+function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => void): Promise<T> {
+  if (!ms || ms <= 0) return promise;
+
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => {
+      try {
+        onTimeout();
+      } catch {}
+      reject(
+        new AppError({
+          code: "TIMED_OUT",
+          message: `Job timed out after ${ms}ms`,
+          retryable: true,
+        })
+      );
+    }, ms);
+
+    promise.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
 }
 
 async function main() {
@@ -181,12 +197,21 @@ async function main() {
     "audio-jobs",
     async (job) => {
       const jobId = String(job.id);
+      const { type, assetId, inputVersion, requestId } = job.data;
+
+      let outVersion: number | null = null;
+      let outObjectKey: string | null = null;
 
       try {
-        console.log("Job start:", jobId, job.data);
-
-        const { type, assetId, inputVersion } = job.data;
-        const assetKey = `asset:${assetId}`;
+        logJson({
+          level: "info",
+          msg: "Job start",
+          requestId: requestId ?? null,
+          jobId,
+          assetId,
+          jobType: type,
+          fromVersion: inputVersion,
+        });
 
         await saveJobStatus(connection, jobId, {
           status: "RUNNING",
@@ -194,6 +219,9 @@ async function main() {
           assetId,
           type,
           inputVersion: String(inputVersion),
+          ...(requestId ? { requestId } : {}),
+          attemptsMade: String(job.attemptsMade ?? 0),
+          attemptsMax: String(job.opts.attempts ?? 1),
         });
 
         // ---------- input meta ----------
@@ -210,14 +238,18 @@ async function main() {
         // ---------- select module ----------
         const module: ProcessingModule | undefined = modules[type];
         if (!module) {
-          throw new Error(`Unknown processing module: ${type}`);
+          throw new AppError({
+            code: "BAD_INPUT",
+            message: `Unknown processing module: ${type}`,
+            retryable: false,
+            details: { type },
+          });
         }
 
         // ---------- prepare output version + key ----------
-        const outVersion = await pickNextVersion(connection, assetId, inputVersion);
-        const outObjectKey = `assets/${assetId}/v${outVersion}/${fileNameForType(type)}`;
+        outVersion = await pickNextVersion(connection, assetId, inputVersion);
+        outObjectKey = `assets/${assetId}/v${outVersion}/${fileNameForType(type)}`;
 
-        // создаём версию сразу (PENDING)
         await createPendingVersionMeta({
           redis: connection,
           assetId,
@@ -226,28 +258,38 @@ async function main() {
           inputVersion,
           jobId,
           objectKey: outObjectKey,
+          requestId,
         });
 
         await job.updateProgress(10);
 
-        // ---------- run module ----------
-        const result = await module.run({
-          assetId,
-          inputVersion,
-          jobId,
+        // ---------- run module with REAL timeout + abort ----------
+        const timeoutMs = typeof job.opts.timeout === "number" ? job.opts.timeout : 0;
+        const ac = new AbortController();
 
-          // подсказки модулю (куда писать)
-          outputVersion: outVersion,
-          outputObjectKey: outObjectKey,
-
-          // подсказка (откуда читать)
-          inputObjectKey: inMeta.objectKey,
-
-          payload: job.data,
-        } as any);
+        const result = await withTimeout(
+          module.run({
+            assetId,
+            inputVersion,
+            jobId,
+            outputObjectKey: outObjectKey,
+            payload: job.data,
+            signal: ac.signal, // <- модуль может убить ffmpeg
+            // подсказка модулю (откуда читать) — loopApply ожидает inputObjectKey
+            inputObjectKey: inMeta.objectKey as any,
+            outputVersion: outVersion as any,
+          } as any),
+          timeoutMs,
+          () => ac.abort()
+        );
 
         if (!result.ok) {
-          throw new Error(`Module ${type} failed`);
+          throw new AppError({
+            code: "PROCESSING_FAILED",
+            message: `Module ${type} returned ok=false`,
+            retryable: false,
+            details: { type },
+          });
         }
 
         // ВАЖНО: файл должен реально существовать
@@ -258,7 +300,6 @@ async function main() {
           })
         );
 
-        // ---------- READY + latest ----------
         await markVersionReady({
           redis: connection,
           assetId,
@@ -272,9 +313,23 @@ async function main() {
           finishedAt: new Date().toISOString(),
           createdVersion: String(outVersion),
           objectKey: result.objectKey,
+          attemptsMade: String(job.attemptsMade ?? 0),
+          attemptsMax: String(job.opts.attempts ?? 1),
         });
 
         await job.updateProgress(100);
+
+        logJson({
+          level: "info",
+          msg: "Job succeeded",
+          requestId: requestId ?? null,
+          jobId,
+          assetId,
+          jobType: type,
+          fromVersion: inputVersion,
+          toVersion: outVersion,
+          objectKey: result.objectKey,
+        });
 
         return {
           ok: true,
@@ -285,25 +340,30 @@ async function main() {
           type,
         };
       } catch (err) {
-        const e = classifyError(err);
-        console.error("PROCESSING ERROR", {
+        const e = toAppError(err);
+
+        // запретить ретраи для неретраимых ошибок
+        if (!e.retryable) {
+          try {
+            await job.discard();
+          } catch {}
+        }
+
+        logJson({
+          level: "error",
+          msg: "Job failed",
+          requestId: requestId ?? null,
           jobId,
-          type: (job.data as any)?.type,
-          assetId: (job.data as any)?.assetId,
-          inputVersion: (job.data as any)?.inputVersion,
-          error: e,
+          assetId,
+          jobType: type,
+          fromVersion: inputVersion,
+          toVersion: outVersion ?? null,
+          error: e.toJSON(),
         });
 
-        // если успели создать outVersion — попробуем пометить FAILED
-        const assetId = (job.data as any)?.assetId as string | undefined;
-        const inputVersion = (job.data as any)?.inputVersion as number | undefined;
-
-        // мы не всегда знаем outVersion, но чаще знаем (по тому же алгоритму)
-        if (assetId && typeof inputVersion === "number") {
+        // если успели создать версию — пометим FAILED
+        if (outVersion != null) {
           try {
-            const outVersion = await pickNextVersion(connection, assetId, inputVersion);
-            // ВНИМАНИЕ: pickNextVersion вернёт next+1, а нам нужен тот, который создавали.
-            // Поэтому помечаем FAILED только если эта версия уже существует и PENDING.
             const maybe = await connection.hgetall(`asset:${assetId}:v:${outVersion}`);
             if (maybe?.status === "PENDING") {
               await markVersionFailed({ redis: connection, assetId, outVersion, error: e });
@@ -312,11 +372,13 @@ async function main() {
         }
 
         await saveJobStatus(connection, jobId, {
-          status: "FAILED",
+          status: e.code === "TIMED_OUT" ? "TIMED_OUT" : "FAILED",
           finishedAt: new Date().toISOString(),
           errorCode: e.code,
           errorMessage: e.message,
           errorRetryable: String(e.retryable),
+          attemptsMade: String(job.attemptsMade ?? 0),
+          attemptsMax: String(job.opts.attempts ?? 1),
         });
 
         throw err;
@@ -325,10 +387,19 @@ async function main() {
     { connection }
   );
 
-  worker.on("completed", (job) => console.log("Job completed:", job.id));
-  worker.on("failed", (job, err) => console.error("Job failed:", job?.id, err));
+  worker.on("completed", (job) =>
+    logJson({ level: "info", msg: "Worker completed", jobId: String(job.id) })
+  );
+  worker.on("failed", (job, err) =>
+    logJson({
+      level: "error",
+      msg: "Worker failed",
+      jobId: String(job?.id),
+      error: toAppError(err).toJSON(),
+    })
+  );
 
-  console.log("Worker is running and listening queue: audio-jobs");
+  logJson({ level: "info", msg: "Worker running", queue: "audio-jobs" });
 }
 
 main().catch((err) => {

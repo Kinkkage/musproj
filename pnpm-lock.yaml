@@ -70,6 +70,8 @@ importers:
         specifier: ^5.9.3
         version: 5.9.3
 
+  packages/shared: {}
+
 packages:
 
   '@aws-crypto/crc32@5.2.0':

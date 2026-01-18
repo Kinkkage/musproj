@@ -1,4 +1,12 @@
-import "dotenv/config";
+import dotenv from "dotenv";
+import { fileURLToPath } from "url";
+import { dirname, resolve } from "path";
+
+// гарантированно грузим apps/api/.env (независимо от того, откуда ты запускаешь)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+dotenv.config({ path: resolve(__dirname, "../.env") });
+
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { z } from "zod";
@@ -60,6 +68,34 @@ async function main() {
   // -----------------------------
   const app = Fastify({ logger: true });
   await app.register(cors, { origin: true });
+
+  // ---- requestId middleware (observability) ----
+  app.addHook("onRequest", async (req, reply) => {
+    const requestId = crypto.randomUUID();
+    (req as any).requestId = requestId;
+    reply.header("X-Request-Id", requestId);
+  });
+
+  // ---- job config by type (retry/timeout policy) ----
+  const JOB_CONFIG: Record<
+    string,
+    { attempts: number; timeout: number; backoff: { type: "exponential"; delay: number } }
+  > = {
+    LOOP_APPLY: {
+      attempts: Number(process.env.LOOP_APPLY_ATTEMPTS ?? 3),
+      timeout: Number(process.env.LOOP_APPLY_TIMEOUT_MS ?? 120000),
+      backoff: { type: "exponential", delay: Number(process.env.LOOP_APPLY_BACKOFF_MS ?? 2000) },
+    },
+    DEFAULT: {
+      attempts: Number(process.env.JOB_ATTEMPTS_DEFAULT ?? 3),
+      timeout: Number(process.env.JOB_TIMEOUT_DEFAULT_MS ?? 120000),
+      backoff: { type: "exponential", delay: Number(process.env.JOB_BACKOFF_DEFAULT_MS ?? 2000) },
+    },
+  };
+
+  function cfgFor(type: string) {
+    return JOB_CONFIG[type] ?? JOB_CONFIG.DEFAULT;
+  }
 
   app.get("/health", async () => ({ status: "ok" }));
 
@@ -209,7 +245,7 @@ async function main() {
   });
 
   // =========================================
-  // Loop apply (A): создаём job, worker скопирует файл + сохранит мета
+  // Loop apply: создаём job LOOP_APPLY (с requestId)
   // =========================================
 
   const LoopApplyBody = z.object({
@@ -218,92 +254,108 @@ async function main() {
   });
 
   app.post("/loop/apply", async (req, reply) => {
-  const body = LoopApplyBody.parse(req.body);
+    const body = LoopApplyBody.parse(req.body);
+    const requestId = (req as any).requestId as string;
 
-  // 1) убеждаемся, что input версия существует
-  const inMeta = await connection.hgetall(`asset:${body.assetId}:v:${body.version}`);
-  if (!inMeta?.objectKey) return reply.code(404).send({ error: "Input version not found" });
+    // 1) убеждаемся, что input версия существует
+    const inMeta = await connection.hgetall(`asset:${body.assetId}:v:${body.version}`);
+    if (!inMeta?.objectKey) return reply.code(404).send({ error: "Input version not found" });
 
-  // 2) берём preview мету
-  const previewKey = `asset:${body.assetId}:loopPreview:v${body.version}`;
-  const preview = await connection.hgetall(previewKey);
-  if (!preview?.startMs || !preview?.endMs) {
-    return reply.code(400).send({
-      error: "Loop preview not set for this version",
-      need: "POST /loop/preview first",
-      previewKey,
+    // 2) берём preview мету
+    const previewKey = `asset:${body.assetId}:loopPreview:v${body.version}`;
+    const preview = await connection.hgetall(previewKey);
+    if (!preview?.startMs || !preview?.endMs) {
+      return reply.code(400).send({
+        error: "Loop preview not set for this version",
+        need: "POST /loop/preview first",
+        previewKey,
+      });
+    }
+
+    const loop = {
+      startMs: Number(preview.startMs),
+      endMs: Number(preview.endMs),
+      crossfadeMs: Number(preview.crossfadeMs ?? "10"),
+    };
+
+    // 3) idempotency key (одинаковые входы -> один jobId)
+    const paramsString = JSON.stringify({
+      assetId: body.assetId,
+      inputVersion: body.version,
+      loop,
     });
-  }
 
-  const loop = {
-    startMs: Number(preview.startMs),
-    endMs: Number(preview.endMs),
-    crossfadeMs: Number(preview.crossfadeMs ?? "10"),
-  };
+    const paramsHash = crypto.createHash("sha1").update(paramsString).digest("hex");
+    const idemKey = `idem:LOOP_APPLY:${body.assetId}:v${body.version}:${paramsHash}`;
 
-  // 3) idempotency key (одинаковые входы -> один jobId)
-  const paramsString = JSON.stringify({
-    assetId: body.assetId,
-    inputVersion: body.version,
-    loop,
-  });
+    const cfg = cfgFor("LOOP_APPLY");
 
-  const paramsHash = crypto.createHash("sha1").update(paramsString).digest("hex");
-  const idemKey = `idem:LOOP_APPLY:${body.assetId}:v${body.version}:${paramsHash}`;
+    const existingJobId = await connection.get(idemKey);
+    if (existingJobId) {
+      return reply.send({
+        ok: true,
+        jobId: existingJobId,
+        idem: true,
+        requestId,
+        debug: {
+          attempts: cfg.attempts,
+          timeoutMs: cfg.timeout,
+          backoffMs: cfg.backoff.delay,
+        },
+        note: "Same params -> returning existing jobId",
+      });
+    }
 
-  const existingJobId = await connection.get(idemKey);
-  if (existingJobId) {
-    return reply.send({
-      ok: true,
-      jobId: existingJobId,
-      idem: true,
-      note: "Same params -> returning existing jobId",
-    });
-  }
-
-  // 4) создаём job "LOOP_APPLY"
-  const job = await audioQueue.add(
-    "audio-job",
-    {
+    // 4) создаём job "LOOP_APPLY" с конфигом по типу
+    const jobData = {
       type: "LOOP_APPLY",
       assetId: body.assetId,
       inputVersion: body.version,
       loop,
-      idemKey,        // полезно хранить и в job.data
-      paramsHash,     // полезно для отладки
-    },
-    {
-    removeOnComplete: false,
-    removeOnFail: false,
-    attempts: 3,
-    backoff: { type: "exponential", delay: 2000 },
-    timeout: 2 * 60 * 1000,
-}
+      idemKey,
+      paramsHash,
+      requestId,
+    };
 
-  );
+    const jobOpts = {
+      removeOnComplete: false,
+      removeOnFail: false,
+      attempts: cfg.attempts,
+      backoff: cfg.backoff,
+      timeout: cfg.timeout,
+    };
 
-  // 5) сохраняем idemKey -> jobId (чтобы повтор не создавал дубль)
-  await connection.set(idemKey, String(job.id));
+    const job = await audioQueue.add("audio-job", jobData, jobOpts);
 
-  await connection.hset(`job:${job.id}`, {
-    jobId: String(job.id),
-    assetId: body.assetId,
-    type: "LOOP_APPLY",
-    inputVersion: String(body.version),
-    paramsHash,
-    idemKey,
-    createdAt: new Date().toISOString(),
+    // 5) сохраняем idemKey -> jobId (чтобы повтор не создавал дубль)
+    await connection.set(idemKey, String(job.id));
+
+    await connection.hset(`job:${job.id}`, {
+      jobId: String(job.id),
+      assetId: body.assetId,
+      type: "LOOP_APPLY",
+      inputVersion: String(body.version),
+      paramsHash,
+      idemKey,
+      requestId,
+      createdAt: new Date().toISOString(),
+      attemptsMax: String(cfg.attempts),
+      timeoutMs: String(cfg.timeout),
+    });
+
+    return reply.send({
+      ok: true,
+      jobId: String(job.id),
+      idem: false,
+      requestId,
+      debug: {
+        attempts: cfg.attempts,
+        timeoutMs: cfg.timeout,
+        backoffMs: cfg.backoff.delay,
+      },
+      note: "Worker will create a new version in R2 and attach loop metadata.",
+    });
   });
-
-  return reply.send({
-    ok: true,
-    jobId: String(job.id),
-    idem: false,
-    note: "Worker will create a new version in R2 and attach loop metadata.",
-  });
-});
-
-
 
   // =========================================
   // Jobs (queue) endpoints
@@ -317,42 +369,47 @@ async function main() {
 
   app.post("/jobs", async (req, reply) => {
     const body = CreateJobBody.parse(req.body);
+    const requestId = (req as any).requestId as string;
 
     const latestStr = await connection.get(`asset:${body.assetId}:latestVersion`);
     const latest = latestStr ? Number(latestStr) : 1;
     const inputVersion = body.inputVersion ?? latest;
-    // Проверка: существует ли версия inputVersion
-const vMeta = await connection.hgetall(`asset:${body.assetId}:v:${inputVersion}`);
-if (!vMeta?.objectKey) {
-  return reply.code(404).send({
-    error: "Input version not found",
-    assetId: body.assetId,
-    inputVersion,
-  });
-}
+
+    const vMeta = await connection.hgetall(`asset:${body.assetId}:v:${inputVersion}`);
+    if (!vMeta?.objectKey) {
+      return reply.code(404).send({
+        error: "Input version not found",
+        assetId: body.assetId,
+        inputVersion,
+      });
+    }
+
+    const cfg = cfgFor(body.type);
 
     const job = await audioQueue.add(
-  "audio-job",
-  { type: body.type, assetId: body.assetId, inputVersion },
-  {
-    removeOnComplete: false,
-    removeOnFail: false,
-    attempts: 3,
-    backoff: { type: "exponential", delay: 2000 },
-    timeout: 2 * 60 * 1000,
-  }
-);
-
+      "audio-job",
+      { type: body.type, assetId: body.assetId, inputVersion, requestId },
+      {
+        removeOnComplete: false,
+        removeOnFail: false,
+        attempts: cfg.attempts,
+        backoff: cfg.backoff,
+        timeout: cfg.timeout,
+      }
+    );
 
     await connection.hset(`job:${job.id}`, {
       jobId: String(job.id),
       assetId: body.assetId,
       type: body.type,
       inputVersion: String(inputVersion),
+      requestId,
       createdAt: new Date().toISOString(),
+      attemptsMax: String(cfg.attempts),
+      timeoutMs: String(cfg.timeout),
     });
 
-    return reply.send({ jobId: String(job.id) });
+    return reply.send({ jobId: String(job.id), requestId });
   });
 
   app.get("/jobs/:id", async (req, reply) => {
@@ -361,12 +418,32 @@ if (!vMeta?.objectKey) {
     if (!job) return reply.code(404).send({ error: "Job not found" });
 
     const state = await job.getState();
+
+    // читаем диагностику из Redis (то, что пишет worker/api)
+    const meta = await connection.hgetall(`job:${id}`);
+
+    const error =
+      meta?.errorCode || meta?.errorMessage
+        ? {
+            code: meta.errorCode ?? null,
+            message: meta.errorMessage ?? null,
+            retryable: meta.errorRetryable ? meta.errorRetryable === "true" : null,
+          }
+        : null;
+
     return reply.send({
       jobId: String(job.id),
       state,
+      status: meta?.status ?? state,
       progress: job.progress,
+      attemptsMade: job.attemptsMade ?? 0,
+      attemptsMax: job.opts.attempts ?? Number(meta?.attemptsMax ?? 1),
+      startedAt: meta?.startedAt ?? null,
+      finishedAt: meta?.finishedAt ?? null,
+      requestId: meta?.requestId ?? null,
       result: job.returnvalue ?? null,
       failedReason: job.failedReason ?? null,
+      error,
     });
   });
 

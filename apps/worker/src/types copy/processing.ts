@@ -6,10 +6,13 @@ export type ProcessingInput = {
   /** where module must write output in R2 */
   outputObjectKey: string;
 
-  payload: Record<string, any>;
+  /** where module should read input from in R2 (passed by worker) */
+  inputObjectKey?: string;
 
-  /** optional abort signal for timeouts/cancel */
-  signal?: AbortSignal;
+  /** optional output version if module wants it (worker passes it) */
+  outputVersion?: number;
+
+  payload: Record<string, any>;
 };
 
 export type ProcessingOutput = {
